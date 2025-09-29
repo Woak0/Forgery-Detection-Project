@@ -145,14 +145,3 @@ def visualize_ela(image_path, quality=90, scale=10, save_path=None):
         print(f"Visualization saved to {save_path}")
     
     plt.show()
-
-
-# Example usage
-if __name__ == "__main__":
-    # Test ELA generation
-    test_image = "path/to/your/image.jpg"
-    
-    if os.path.exists(test_image):
-        visualize_ela(test_image, quality=90, scale=15)
-    else:
-        print("Please provide a valid image path to test ELA")

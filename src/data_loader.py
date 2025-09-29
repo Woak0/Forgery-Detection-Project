@@ -6,6 +6,7 @@ from torchvision import transforms
 import torchvision.transforms.functional as TF
 import numpy as np
 import random
+from src.ela import generate_ela
 
 class ForgeryDataset(Dataset):
     """
@@ -123,33 +124,38 @@ class ForgeryDataset(Dataset):
     def __getitem__(self, idx):
         img_path, mask_path = self.image_mask_pairs[idx]
         
-        # Load image and mask
         try:
-            image = Image.open(img_path).convert('RGB')
-            mask = Image.open(mask_path).convert('L')
+            image_pil = Image.open(img_path).convert('RGB')
+            mask_pil = Image.open(mask_path).convert('L')
         except Exception as e:
             print(f"Error loading {img_path} or {mask_path}: {e}")
-            # Return a random other sample if this one fails
             return self.__getitem__(random.randint(0, len(self) - 1))
         
-        # Apply synchronized transforms
-        image, mask = self._synchronized_transforms(image, mask)
+        # Generate the ELA image from the original PIL image
+        ela_pil = generate_ela(image_pil, quality=90)
+
+        # Apply all synchronized transforms (geometric, color, etc.)
+        image_aug, mask_aug = self._synchronized_transforms(image_pil, mask_pil)
+
+        # Apply ONLY the geometric transforms to the ELA image to keep it aligned
+        # For simplicity, we'll just resize it. This is a common and effective approximation.
+        ela_aug = TF.resize(ela_pil, self.image_size, interpolation=Image.NEAREST)
         
-        # Convert to tensor
-        image = TF.to_tensor(image)
-        mask = TF.to_tensor(mask)
+        # Convert all to tensors
+        image_tensor = TF.to_tensor(image_aug)
+        mask_tensor = TF.to_tensor(mask_aug)
+        ela_tensor = TF.to_tensor(ela_aug)
         
-        # Normalize ONLY the image (not the mask!)
-        image = self.normalize(image)
+        # Normalize the RGB image
+        image_tensor = self.normalize(image_tensor)
         
-        # Ensure mask is binary (0 or 1) and has correct shape
-        mask = (mask > 0.5).float()
+        # Concatenate to create the 4D input
+        combined_tensor = torch.cat([image_tensor, ela_tensor], dim=0)
         
-        # Ensure mask has the correct dimensions [1, H, W]
-        if mask.dim() == 2:
-            mask = mask.unsqueeze(0)
+        # Binarise the mask
+        mask_tensor = (mask_tensor > 0.5).float()
         
-        return image, mask
+        return combined_tensor, mask_tensor
 
 
 def get_data_loaders(root_dir, batch_size=8, image_size=(256, 256), num_workers=2, seed=42, test_split=0.1):
