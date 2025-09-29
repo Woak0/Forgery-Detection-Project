@@ -1,0 +1,27 @@
+# Core ML & Data Handling
+numpy
+
+# Deep Learning Framework (PyTorch)
+# torch is the main library, torchvision provides utilities for computer vision
+torch
+torchvision
+
+# Image Processing
+# Used for opening, manipulating, and saving images (e.g., for ELA)
+Pillow
+
+# Plotting and Visualization
+# Used to display images, masks, and results in our notebooks
+matplotlib
+
+# Model Evaluation Metrics
+# Used for calculating Precision, Recall, F1-score, and IoU
+scikit-learn
+
+# Utilities
+# For creating smart progress bars for our training loops
+tqdm
+
+# For local development in VS Code / Jupyter
+# This is not needed for the final Colab submission but is essential locally
+notebook
