@@ -1,162 +1,249 @@
+"""
+Enhanced U-Net model with attention mechanisms for image forgery detection.
+Fixed issues from code review.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.transforms.functional as TF
 
-class AttentionGate(nn.Module):
-    def __init__(self, F_g, F_l, F_int):
-        super(AttentionGate, self).__init__()
-        # W_g is the conv layer for the gating signal (from the decoder)
-        self.W_g = nn.Sequential(
-            nn.Conv2d(F_g, F_int, kernel_size=1, stride=1, padding=0, bias=True),
-            nn.BatchNorm2d(F_int)
+
+class ChannelAttention(nn.Module):
+    """Channel attention mechanism"""
+    def __init__(self, in_planes, ratio=8):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        
+        self.fc = nn.Sequential(
+            nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False),
+            nn.ReLU(),
+            nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+        )
+        self.sigmoid = nn.Sigmoid()
+    
+    def forward(self, x):
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        return self.sigmoid(avg_out + max_out)
+
+
+class SpatialAttention(nn.Module):
+    """Spatial attention mechanism"""
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=kernel_size//2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+    
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x_cat = torch.cat([avg_out, max_out], dim=1)
+        return self.sigmoid(self.conv1(x_cat))
+
+
+class CBAM(nn.Module):
+    """Convolutional Block Attention Module - Fixed sequential application"""
+    def __init__(self, in_planes, ratio=8, kernel_size=7):
+        super().__init__()
+        self.ca = ChannelAttention(in_planes, ratio)
+        self.sa = SpatialAttention(kernel_size)
+    
+    def forward(self, x):
+        # Apply channel attention first, then spatial attention to the result
+        x_ca = self.ca(x) * x
+        x_sa = self.sa(x_ca) * x_ca
+        return x_sa
+
+
+class ASPP(nn.Module):
+    """Atrous Spatial Pyramid Pooling"""
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        
+        self.conv2 = nn.Conv2d(in_channels, out_channels, 3, padding=6, dilation=6, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        
+        self.conv3 = nn.Conv2d(in_channels, out_channels, 3, padding=12, dilation=12, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_channels)
+        
+        self.conv4 = nn.Conv2d(in_channels, out_channels, 3, padding=18, dilation=18, bias=False)
+        self.bn4 = nn.BatchNorm2d(out_channels)
+        
+        self.pool = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels)
         )
         
-        # W_x is the conv layer for the skip connection signal (from the encoder)
-        self.W_x = nn.Sequential(
-            nn.Conv2d(F_l, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+        self.project = nn.Sequential(
+            nn.Conv2d(out_channels * 5, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+    
+    def forward(self, x):
+        size = x.shape[2:]
+        
+        feat1 = F.relu(self.bn1(self.conv1(x)))
+        feat2 = F.relu(self.bn2(self.conv2(x)))
+        feat3 = F.relu(self.bn3(self.conv3(x)))
+        feat4 = F.relu(self.bn4(self.conv4(x)))
+        feat5 = F.relu(self.pool(x))
+        feat5 = F.interpolate(feat5, size=size, mode='bilinear', align_corners=False)
+        
+        out = torch.cat([feat1, feat2, feat3, feat4, feat5], dim=1)
+        return self.project(out)
+
+
+class AttentionGate(nn.Module):
+    """Attention gate for skip connections"""
+    def __init__(self, F_g, F_l, F_int):
+        super().__init__()
+        self.W_g = nn.Sequential(
+            nn.Conv2d(F_g, F_int, 1, bias=False),
             nn.BatchNorm2d(F_int)
         )
-
-        # psi combines the processed signals
+        self.W_x = nn.Sequential(
+            nn.Conv2d(F_l, F_int, 1, bias=False),
+            nn.BatchNorm2d(F_int)
+        )
         self.psi = nn.Sequential(
-            nn.Conv2d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.Conv2d(F_int, 1, 1, bias=False),
             nn.BatchNorm2d(1),
             nn.Sigmoid()
         )
-        
         self.relu = nn.ReLU(inplace=True)
-
+    
     def forward(self, g, x):
-        # g is the gating signal from the coarser decoder layer
-        # x is the skip connection from the encoder layer
         g1 = self.W_g(g)
         x1 = self.W_x(x)
         psi = self.relu(g1 + x1)
         psi = self.psi(psi)
-
-        # The output attention map is multiplied with the original skip connection
-        # to suppress irrelevant regions
         return x * psi
 
-class DoubleConv(nn.Module):
-    """(Convolution => [Batch Normalization] => ReLU) * 2"""
 
-    def __init__(self, in_channels, out_channels, mid_channels=None, dropout=0.1):
+class EnhancedDoubleConv(nn.Module):
+    """Enhanced double convolution with fixed residual connection"""
+    def __init__(self, in_channels, out_channels, mid_channels=None, dropout=0.2):
         super().__init__()
         if not mid_channels:
             mid_channels = out_channels
-        self.double_conv = nn.Sequential(
-            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_channels),
+        
+        self.conv1 = nn.Conv2d(in_channels, mid_channels, 3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(mid_channels)
+        self.conv2 = nn.Conv2d(mid_channels, out_channels, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout2d(dropout)
+        self.attention = CBAM(out_channels)
+        
+        # Skip connection
+        self.skip = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else None
+    
+    def forward(self, x):
+        residual = self.skip(x) if self.skip else x
+        
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.dropout(out)
+        out = self.bn2(self.conv2(out))
+        
+        # Apply attention before adding residual
+        out = self.attention(out)
+        
+        # Add residual before final activation
+        if residual.shape == out.shape:
+            out = out + residual
+        
+        return self.relu(out)
+
+
+class EnhancedUNet(nn.Module):
+    """U-Net with attention mechanisms - Fixed bottleneck and channel dimensions"""
+    def __init__(self, n_channels=4, n_classes=1, features=[64, 128, 256, 512], dropout=0.2):
+        super().__init__()
+        
+        # Initial processing
+        self.initial = nn.Sequential(
+            nn.Conv2d(n_channels, features[0], 3, padding=1, bias=False),
+            nn.BatchNorm2d(features[0]),
             nn.ReLU(inplace=True),
-            nn.Dropout2d(dropout),
-            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
+            ChannelAttention(features[0])
         )
-
-    def forward(self, x):
-        return self.double_conv(x)
-
-class Down(nn.Module):
-    """Downscaling with maxpool then double conv"""
-
-    def __init__(self, in_channels, out_channels, dropout=0.1):
-        super().__init__()
-        self.maxpool_conv = nn.Sequential(
-            nn.MaxPool2d(2),
-            DoubleConv(in_channels, out_channels, dropout=dropout)
+        
+        # Encoder
+        self.encoder1 = EnhancedDoubleConv(features[0], features[0], dropout=dropout)
+        self.pool1 = nn.MaxPool2d(2)
+        
+        self.encoder2 = EnhancedDoubleConv(features[0], features[1], dropout=dropout)
+        self.pool2 = nn.MaxPool2d(2)
+        
+        self.encoder3 = EnhancedDoubleConv(features[1], features[2], dropout=dropout)
+        self.pool3 = nn.MaxPool2d(2)
+        
+        self.encoder4 = EnhancedDoubleConv(features[2], features[3], dropout=dropout)
+        self.pool4 = nn.MaxPool2d(2)
+        
+        # Bottleneck - Fixed to not double channels unnecessarily
+        self.bottleneck = nn.Sequential(
+            EnhancedDoubleConv(features[3], features[3], dropout=dropout),
+            ASPP(features[3], features[3])  # Apply ASPP directly without doubling
         )
-
-    def forward(self, x):
-        return self.maxpool_conv(x)
-
-class Up(nn.Module):
-    """Upscaling then double conv, now with an Attention Gate"""
-
-    def __init__(self, in_channels, out_channels, bilinear=True, dropout=0.1):
-        super().__init__()
-
-        # if bilinear, use the normal convolutions to reduce the number of channels
-        if bilinear:
-            self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-            # The input to the conv is now only out_channels, not in_channels
-            self.conv = DoubleConv(in_channels, out_channels, in_channels // 2, dropout=dropout)
-        else:
-            self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
-            self.conv = DoubleConv(in_channels, out_channels, dropout=dropout)
-            
-        # Initialize the attention gate
-        self.att = AttentionGate(F_g=in_channels//2, F_l=in_channels//2, F_int=in_channels//4)
-
-    def forward(self, x1, x2):
-        # x1 is from the upsampling path, x2 is the skip connection
-        x1 = self.up(x1)
         
-        # --- Run the skip connection through the attention gate ---
-        x2 = self.att(g=x1, x=x2)
-        # --------------------------------------------------------
-
-        # Pad x1 if its size doesn't match x2
-        diffY = x2.size()[2] - x1.size()[2]
-        diffX = x2.size()[3] - x1.size()[3]
-
-        x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
-                        diffY // 2, diffY - diffY // 2])
+        # Decoder with fixed channel dimensions
+        self.upconv4 = nn.ConvTranspose2d(features[3], features[3], 2, stride=2)
+        self.att4 = AttentionGate(features[3], features[3], features[3]//2)
+        self.decoder4 = EnhancedDoubleConv(features[3]*2, features[3], dropout=dropout)
         
-        x = torch.cat([x2, x1], dim=1)
-        return self.conv(x)
-
-class OutConv(nn.Module):
-    """Final output convolution layer"""
-    def __init__(self, in_channels, out_channels):
-        super(OutConv, self).__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
-
-    def forward(self, x):
-        return self.conv(x)
-
-
-class UNet(nn.Module):
-    """
-    The main U-Net architecture.
-    This class assembles the encoder (Down modules), decoder (Up modules),
-    and the input/output convolutions.
-    """
-    def __init__(self, n_channels, n_classes, bilinear=True, dropout=0.1):
-        super(UNet, self).__init__()
-        self.n_channels = n_channels
-        self.n_classes = n_classes
-        self.bilinear = bilinear
-
-        # Encoder Path
-        self.inc = DoubleConv(n_channels, 64, dropout=dropout)
-        self.down1 = Down(64, 128, dropout=dropout)
-        self.down2 = Down(128, 256, dropout=dropout)
-        self.down3 = Down(256, 512, dropout=dropout)
-        factor = 2 if bilinear else 1
-        self.down4 = Down(512, 1024 // factor, dropout=dropout)
-
-        # Decoder Path
-        self.up1 = Up(1024, 512 // factor, bilinear, dropout=dropout)
-        self.up2 = Up(512, 256 // factor, bilinear, dropout=dropout)
-        self.up3 = Up(256, 128 // factor, bilinear, dropout=dropout)
-        self.up4 = Up(128, 64, bilinear, dropout=dropout)
-        self.outc = OutConv(64, n_classes)
-
-    def forward(self, x):
-        # Pass input through the encoder, saving the output of each stage for skip connections
-        x1 = self.inc(x)
-        x2 = self.down1(x1)
-        x3 = self.down2(x2)
-        x4 = self.down3(x3)
-        x5 = self.down4(x4)
+        self.upconv3 = nn.ConvTranspose2d(features[3], features[2], 2, stride=2)
+        self.att3 = AttentionGate(features[2], features[2], features[2]//2)
+        self.decoder3 = EnhancedDoubleConv(features[2]*2, features[2], dropout=dropout)
         
-        # Pass through the decoder, feeding in the skip connections
-        x = self.up1(x5, x4)
-        x = self.up2(x, x3)
-        x = self.up3(x, x2)
-        x = self.up4(x, x1)
-        logits = self.outc(x)
-        return logits
+        self.upconv2 = nn.ConvTranspose2d(features[2], features[1], 2, stride=2)
+        self.att2 = AttentionGate(features[1], features[1], features[1]//2)
+        self.decoder2 = EnhancedDoubleConv(features[1]*2, features[1], dropout=dropout)
+        
+        self.upconv1 = nn.ConvTranspose2d(features[1], features[0], 2, stride=2)
+        self.att1 = AttentionGate(features[0], features[0], features[0]//2)
+        self.decoder1 = EnhancedDoubleConv(features[0]*2, features[0], dropout=dropout)
+        
+        # Output
+        self.out = nn.Conv2d(features[0], n_classes, 1)
+    
+    def forward(self, x):
+        # Initial processing
+        x = self.initial(x)
+        
+        # Encoder
+        enc1 = self.encoder1(x)
+        enc2 = self.encoder2(self.pool1(enc1))
+        enc3 = self.encoder3(self.pool2(enc2))
+        enc4 = self.encoder4(self.pool3(enc3))
+        
+        # Bottleneck
+        bottleneck = self.bottleneck(self.pool4(enc4))
+        
+        # Decoder with attention
+        dec4 = self.upconv4(bottleneck)
+        enc4 = self.att4(dec4, enc4)
+        dec4 = torch.cat([dec4, enc4], dim=1)
+        dec4 = self.decoder4(dec4)
+        
+        dec3 = self.upconv3(dec4)
+        enc3 = self.att3(dec3, enc3)
+        dec3 = torch.cat([dec3, enc3], dim=1)
+        dec3 = self.decoder3(dec3)
+        
+        dec2 = self.upconv2(dec3)
+        enc2 = self.att2(dec2, enc2)
+        dec2 = torch.cat([dec2, enc2], dim=1)
+        dec2 = self.decoder2(dec2)
+        
+        dec1 = self.upconv1(dec2)
+        enc1 = self.att1(dec1, enc1)
+        dec1 = torch.cat([dec1, enc1], dim=1)
+        dec1 = self.decoder1(dec1)
+        
+        return self.out(dec1)
